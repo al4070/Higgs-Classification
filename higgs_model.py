@@ -26,12 +26,13 @@ class Baseline(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.2),
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()
+            #Instead of havung a sigmoid BCEWithLogitsLoss has an internal sigmoid
         )
     
     def forward(self, x):
         return self.model(x)
 
+# This will be the final model
 # Deeper model with batch normalization
 class DeeperNN(nn.Module):
     def __init__(self, input_dim=28, hidden_dim=128):
@@ -53,14 +54,63 @@ class DeeperNN(nn.Module):
             nn.Dropout(0.2),
             
             nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid()
         )
     
     def forward(self, x):
         return self.model(x)
 
-# Training function
-def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, weight_decay=1e-5, max_chunks=None, device=None):
+
+# Function to calculate class weights from a loader with weight factor
+def calculate_class_weights(loader, max_chunks=None, device=None, weight_factor=0.5):
+    """
+    Calculate class weights based on class distribution in the dataset
+    
+    Args:
+        loader: DataLoader to sample from
+        max_chunks: Maximum number of chunks to process
+        device: Computation device
+        weight_factor: Factor to moderate the class weighting (0.0-1.0)
+                       Lower values reduce the effect of class weighting
+        
+    Returns:
+        pos_weight: Weight for positive class in BCEWithLogitsLoss
+    """
+    if device is None:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    pos_count = 0
+    neg_count = 0
+    chunk_count = 0
+    
+    # Sample from the loader to estimate class distribution
+    for _, labels in loader:
+        chunk_count += 1
+        if max_chunks is not None and chunk_count > max_chunks:
+            break
+        
+        pos_count += (labels == 1).sum().item()
+        neg_count += (labels == 0).sum().item()
+    
+    print(f"Class distribution - Positive: {pos_count}, Negative: {neg_count}")
+    
+    # If no examples of a class, use a balanced weight
+    if pos_count == 0 or neg_count == 0:
+        print("Warning: One class has zero samples in estimation set. Using balanced weighting.")
+        pos_weight = torch.tensor([1.0], device=device)
+    else:
+        # Calculate pos_weight for BCEWithLogitsLoss
+        # Multiply by weight_factor to moderate the weighting
+        raw_weight = neg_count/pos_count
+        pos_weight = torch.tensor([weight_factor * raw_weight], device=device)
+    
+    print(f"Raw weight ratio (neg/pos): {neg_count/pos_count:.4f}")
+    print(f"Using weight factor: {weight_factor}")
+    print(f"Final positive class weight: {pos_weight.item():.4f}")
+    return pos_weight
+
+# Modified training function to accept weight_factor
+def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, weight_decay=1e-5, 
+                max_chunks=None, device=None, use_class_weighting=True, weight_factor=0.5):
     """
     Train a PyTorch model
     
@@ -73,6 +123,8 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, weight_deca
         weight_decay: L2 regularization weight
         max_chunks: Maximum number of chunks to process (for testing)
         device: Device to train on (CPU or GPU)
+        use_class_weighting: Whether to use class weighting for imbalanced data
+        weight_factor: Factor to moderate the class weighting (0.0-1.0)
         
     Returns:
         model: Trained model
@@ -85,7 +137,15 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, weight_deca
     
     # Initialize optimizer and loss function
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-    criterion = nn.BCELoss()
+    
+    # Use class weighting if specified
+    if use_class_weighting:
+        print("Calculating class weights...")
+        pos_weight = calculate_class_weights(train_loader, max_chunks=max_chunks, 
+                                            device=device, weight_factor=weight_factor)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    else:
+        criterion = nn.BCEWithLogitsLoss()  # No class weighting
     
     # Initialize history dictionary
     history = {
@@ -167,7 +227,9 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, weight_deca
                 val_samples += labels.size(0)
                 
                 # Store predictions and labels for computing AUC, etc.
-                all_preds.extend(outputs.cpu().numpy())
+                # We need to apply sigmoid here since our model doesn't have it
+                probs = torch.sigmoid(outputs)
+                all_preds.extend(probs.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
         
         # Calculate validation metrics
@@ -216,16 +278,19 @@ def train_model(model, train_loader, val_loader, epochs=5, lr=0.001, weight_deca
     
     return model, history
 
-# Evaluation function
-def evaluate_model(model, test_loader, max_chunks=None, device=None):
+
+# Evaluation function with threshold tuning
+def evaluate_model(model, test_loader, val_loader=None, max_chunks=None, device=None, find_best_threshold=True):
     """
-    Evaluate a trained model on a test set
+    Evaluate a trained model on a test set with threshold tuning
     
     Args:
         model: Trained PyTorch model
         test_loader: Test data loader
+        val_loader: Validation data loader (used to find optimal threshold)
         max_chunks: Maximum number of chunks to process (for testing)
         device: Device to evaluate on (CPU or GPU)
+        find_best_threshold: Whether to find the optimal threshold on validation set
         
     Returns:
         metrics: Dictionary containing evaluation metrics
@@ -236,6 +301,57 @@ def evaluate_model(model, test_loader, max_chunks=None, device=None):
     model = model.to(device)
     model.eval()
     
+    # Find optimal threshold on validation set if requested
+    optimal_threshold = 0.5  # Default threshold
+    
+    if find_best_threshold and val_loader is not None:
+        print("Finding optimal threshold on validation set...")
+        # Collect validation predictions
+        val_preds = []
+        val_labels = []
+        chunk_count = 0
+        
+        with torch.no_grad():
+            for features, labels in val_loader:
+                # Check if we've processed enough chunks
+                chunk_count += 1
+                if max_chunks is not None and chunk_count > max_chunks:
+                    break
+                    
+                # Move data to device
+                features, labels = features.to(device), labels.to(device)
+                
+                # Forward pass
+                outputs = model(features).squeeze()
+                # Apply sigmoid to get probabilities
+                probs = torch.sigmoid(outputs)
+                
+                # Store predictions and labels
+                val_preds.extend(probs.cpu().numpy())
+                val_labels.extend(labels.cpu().numpy())
+        
+        # Try different thresholds to find optimal F1 score
+        thresholds = np.linspace(0.1, 0.9, 30)  # Try 30 thresholds between 0.1 and 0.9
+        best_f1 = 0
+        best_threshold = 0.5
+        
+        for threshold in thresholds:
+            # Make binary predictions using this threshold
+            binary_preds = [1 if p >= threshold else 0 for p in val_preds]
+            
+            # Calculate F1 score
+            from sklearn.metrics import f1_score
+            f1 = f1_score(val_labels, binary_preds)
+            
+            # Check if this is the best F1 score so far
+            if f1 > best_f1:
+                best_f1 = f1
+                best_threshold = threshold
+        
+        optimal_threshold = best_threshold
+        print(f"Optimal threshold: {optimal_threshold:.4f} (F1: {best_f1:.4f})")
+    
+    # Evaluate on test set using optimal threshold
     all_preds = []
     all_labels = []
     chunk_count = 0
@@ -252,13 +368,15 @@ def evaluate_model(model, test_loader, max_chunks=None, device=None):
             
             # Forward pass
             outputs = model(features).squeeze()
+            # Apply sigmoid to get probabilities
+            probs = torch.sigmoid(outputs)
             
             # Store predictions and labels
-            all_preds.extend(outputs.cpu().numpy())
+            all_preds.extend(probs.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
     
-    # Binary predictions for accuracy and confusion matrix
-    bin_preds = [1 if p >= 0.5 else 0 for p in all_preds]
+    # Binary predictions using optimal threshold
+    bin_preds = [1 if p >= optimal_threshold else 0 for p in all_preds]
     
     # Compute metrics
     accuracy = np.mean(np.array(bin_preds) == np.array(all_labels))
@@ -304,19 +422,54 @@ def evaluate_model(model, test_loader, max_chunks=None, device=None):
         'specificity': specificity,
         'confusion_matrix': cm,
         'roc_curve': (fpr, tpr),
-        'pr_curve': (precision, recall)
+        'pr_curve': (precision, recall),
+        'threshold': optimal_threshold
     }
     
     # Print metrics
     print("\nTest Metrics:")
     for metric_name, metric_value in metrics.items():
-        if metric_name not in ['confusion_matrix', 'roc_curve', 'pr_curve']:
+        if metric_name not in ['confusion_matrix', 'roc_curve', 'pr_curve', 'threshold']:
             print(f"{metric_name}: {metric_value:.4f}")
+    
+    print(f"Threshold: {optimal_threshold:.4f}")
     
     print("\nConfusion Matrix:")
     print(cm)
     
     return metrics
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 # Function to visualize training history
 def plot_training_history(history, title='Model Training History'):
@@ -414,10 +567,13 @@ def plot_curves(metrics, title='Model Evaluation'):
     plt.savefig(f"{title.replace(' ', '_').lower()}.png")
     plt.show()
 
-# Function to run experiments with multiple feature sets
-def compare_feature_sets(train_loaders, val_loaders, test_loaders, input_dims, epochs=5, lr=0.001, weight_decay=1e-5, max_chunks=None):
+
+# Function to run experiments with multiple feature sets with threshold tuning
+def compare_feature_sets(train_loaders, val_loaders, test_loaders, input_dims, epochs=5, 
+                         lr=0.001, weight_decay=1e-5, max_chunks=None, use_class_weighting=True,
+                         weight_factor=0.5, find_best_threshold=True):
     """
-    Compare models with different feature sets
+    Compare models with different feature sets with threshold tuning
     
     Args:
         train_loaders: Dictionary of training data loaders for each feature set
@@ -428,6 +584,9 @@ def compare_feature_sets(train_loaders, val_loaders, test_loaders, input_dims, e
         lr: Learning rate
         weight_decay: L2 regularization weight
         max_chunks: Maximum number of chunks to process (for testing)
+        use_class_weighting: Whether to use class weighting for imbalanced data
+        weight_factor: Factor to moderate the class weighting (0.0-1.0)
+        find_best_threshold: Whether to find the optimal threshold
         
     Returns:
         results: Dictionary containing results for each feature set
@@ -453,27 +612,24 @@ def compare_feature_sets(train_loaders, val_loaders, test_loaders, input_dims, e
             lr=lr,
             weight_decay=weight_decay,
             max_chunks=max_chunks,
-            device=device
+            device=device,
+            use_class_weighting=use_class_weighting,
+            weight_factor=weight_factor
         )
         
-        # Evaluate model
+        # Evaluate model with threshold tuning
         metrics = evaluate_model(
             model=trained_model,
             test_loader=test_loaders[feature_set],
+            val_loader=val_loaders[feature_set] if find_best_threshold else None,
             max_chunks=max_chunks,
-            device=device
+            device=device,
+            find_best_threshold=find_best_threshold
         )
         
-        # Plot results
-        plot_training_history(history, title=f'Training History - {feature_set}')
-        plot_curves(metrics, title=f'Evaluation Curves - {feature_set}')
-        
-        # Save model
-        torch.save(trained_model.state_dict(), f"higgs_model_{feature_set.lower().replace(' ', '_')}.pt")
-        
+    
         # Store results
         results[feature_set] = {
-            'model': trained_model,
             'history': history,
             'metrics': metrics
         }
@@ -483,8 +639,8 @@ def compare_feature_sets(train_loaders, val_loaders, test_loaders, input_dims, e
     print("="*80)
     print("FEATURE SET COMPARISON")
     print("="*80)
-    print(f"{'Feature Set':<20} {'Accuracy':<10} {'AUC':<10} {'AP':<10} {'F1':<10} {'Sensitivity':<12} {'Specificity':<12}")
-    print("-"*80)
+    print(f"{'Feature Set':<20} {'Accuracy':<10} {'AUC':<10} {'AP':<10} {'F1':<10} {'Sensitivity':<12} {'Specificity':<12} {'Threshold':<10}")
+    print("-"*100)
     
     for feature_set, result in results.items():
         metrics = result['metrics']
@@ -494,11 +650,20 @@ def compare_feature_sets(train_loaders, val_loaders, test_loaders, input_dims, e
               f"{metrics['ap']:<10.4f} "
               f"{metrics['f1']:<10.4f} "
               f"{metrics['sensitivity']:<12.4f} "
-              f"{metrics['specificity']:<12.4f}")
+              f"{metrics['specificity']:<12.4f} "
+              f"{metrics['threshold']:<10.4f}")
     
     return results
 
-# Example usage:
+
+
+
+
+
+
+
+
+
 if __name__ == "__main__":
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

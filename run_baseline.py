@@ -1,13 +1,20 @@
 import torch
 from torch.utils.data import DataLoader
 import time
+
+# Import your data loader
 from data_loader import ChunkedHiggsDataset, create_data_loaders
+
+# Import models and training functions
 from higgs_model import (
     Baseline, DeeperNN, 
     train_model, evaluate_model, 
     plot_training_history, plot_curves,
     compare_feature_sets
 )
+
+# Import the feature comparison plotting function
+from plot_feature_comparison import plot_feature_comparison
 
 def main():
     # Configuration
@@ -17,14 +24,14 @@ def main():
     lr = 0.001
     weight_decay = 1e-5
     chunk_size = 200000
-    # Set to None to use all data
-    max_chunks = 15
-    # Set to True to compare different feature sets
-    compare_features = True  
-    save_models = True
+    max_chunks = 15  # Set to None to use all data
+    compare_features = True  # Set to True to compare different feature sets
+    use_class_weighting = True  # Enable class weighting for imbalanced data
+    weight_factor = 0.5  # Moderate the class weighting (0.0-1.0)
+    find_best_threshold = True  # Find optimal threshold for classification
     
     # Print experiment configuration
-    print(f"\nRunning Higgs Boson Classification Baseline Experiment")
+    print(f"\nRunning Higgs Boson Classification with Threshold Tuning")
     print(f"Dataset: {file_path}")
     print(f"Epochs: {epochs}")
     print(f"Batch size: {batch_size}")
@@ -32,7 +39,10 @@ def main():
     print(f"Weight decay: {weight_decay}")
     print(f"Max chunks: {max_chunks if max_chunks else 'All'}")
     print(f"Feature set comparison: {compare_features}")
-    print(f"Save models: {save_models}")
+    print(f"Use class weighting: {use_class_weighting}")
+    print(f"Weight factor: {weight_factor}")
+    print(f"Find best threshold: {find_best_threshold}")
+   
     
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -109,8 +119,14 @@ def main():
             epochs=epochs,
             lr=lr,
             weight_decay=weight_decay,
-            max_chunks=max_chunks
+            max_chunks=max_chunks,
+            use_class_weighting=use_class_weighting,
+            weight_factor=weight_factor,
+            find_best_threshold=find_best_threshold
         )
+        
+        # Create overlaid plots comparing all feature sets
+        plot_feature_comparison(results, "Higgs Boson Classification")
         
     else:
         # Just train a single model with all features
@@ -125,11 +141,11 @@ def main():
         
         print(f"\nNumber of features: {num_features}")
         
-        # Creating baseline model
+        # Create model
         model = Baseline(input_dim=num_features)
         
-        # Training the baseline model
-        print("\nTraining baseline model...")
+        # Train model
+        print("\nTraining baseline model with moderated class weighting...")
         trained_model, history = train_model(
             model=model,
             train_loader=train_loader,
@@ -138,26 +154,26 @@ def main():
             lr=lr,
             weight_decay=weight_decay,
             max_chunks=max_chunks,
-            device=device
+            device=device,
+            use_class_weighting=use_class_weighting,
+            weight_factor=weight_factor
         )
         
-        # Evaluate the baseline model on the test set
-        print("\nEvaluating model on test set...")
+        # Evaluate model with threshold tuning
+        print("\nEvaluating model on test set with threshold tuning...")
         metrics = evaluate_model(
             model=trained_model,
             test_loader=test_loader,
+            val_loader=val_loader if find_best_threshold else None,
             max_chunks=max_chunks,
-            device=device
+            device=device,
+            find_best_threshold=find_best_threshold
         )
         
         # Plot results
-        plot_training_history(history, title='Baseline Model Training History')
-        plot_curves(metrics, title='Baseline Model Evaluation')
-        
-        # Save model
-        if save_models:
-            torch.save(trained_model.state_dict(), "higgs_baseline_model.pt")
-            print("Model saved as 'higgs_baseline_model.pt'")
+        plot_training_history(history, title='Baseline Model with Threshold Tuning')
+        plot_curves(metrics, title='Model Evaluation')
+    
     
     # Print total experiment time
     total_time = time.time() - start_time
